@@ -5,17 +5,23 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import platform
+import urllib.parse
 
 try:
     import yt_dlp  # type: ignore
+    from yt_dlp.utils import DownloadError  # type: ignore
 except ImportError:
     sys.stderr.write("Error: The 'yt-dlp' package is required. Install it with 'pip install yt-dlp'.\n")
     sys.exit(1)
 
 
 ALLOWED_FORMATS = {"mp3", "wav", "aiff", "mp4"}
+MEDIA_EXTENSIONS = {
+    ".mp4", ".webm", ".mkv", ".m4a", ".mp3", ".flv", ".avi",
+    ".mov", ".wav", ".aac", ".opus", ".ogg", ".m4v",
+}
 
 
 def parse_time(timestr: str) -> float:
@@ -53,6 +59,110 @@ def sanitize_filename(filename: str) -> str:
     return filename
 
 
+def apply_part_to_url(url: str, part: Optional[int]) -> str:
+    """在 URL 中设置 Bilibili 分P 参数 ?p=N。"""
+    if part is None:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    query["p"] = [str(part)]
+    new_query = urllib.parse.urlencode(query, doseq=True)
+    return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
+
+def resolve_video_duration(info: dict) -> Optional[float]:
+    """从视频信息中解析时长，兼容分P合集。"""
+    duration = info.get("duration")
+    if duration is not None:
+        return float(duration)
+
+    entries = info.get("entries")
+    if entries:
+        first = entries[0]
+        if first and first.get("duration") is not None:
+            return float(first["duration"])
+    return None
+
+
+def build_ydl_opts(
+    tmp_dir: Optional[Path],
+    format_ext: str,
+    cookies_from_browser: str,
+    *,
+    download: bool = True,
+    noplaylist: bool = True,
+) -> dict:
+    """构建 yt-dlp 通用选项。"""
+    if format_ext == "mp4":
+        format_spec = "best[height<=1080]/best"
+    else:
+        format_spec = "bestaudio/best"
+
+    opts = {
+        "format": format_spec,
+        "quiet": True,
+        "no_warnings": True,
+        "cookiesfrombrowser": (cookies_from_browser,),
+        "extractor_retries": 3,
+        "fragment_retries": 3,
+        "retries": 3,
+        "noplaylist": noplaylist,
+    }
+    if download and tmp_dir is not None:
+        opts["outtmpl"] = str(tmp_dir / "%(id)s.%(ext)s")
+    return opts
+
+
+def find_media_files(tmp_dir: Path) -> List[Path]:
+    """在临时目录中查找已下载的媒体文件。"""
+    files = []
+    for path in tmp_dir.iterdir():
+        if not path.is_file():
+            continue
+        if path.name.endswith((".part", ".ytdl")):
+            continue
+        if path.suffix.lower() in MEDIA_EXTENSIONS:
+            files.append(path)
+    return sorted(files)
+
+
+def locate_downloaded_file(tmp_dir: Path, ydl: yt_dlp.YoutubeDL, info: dict) -> str:
+    """定位 yt-dlp 下载后的文件路径。"""
+    candidate = ydl.prepare_filename(info)
+    if os.path.exists(candidate):
+        return candidate
+
+    media_files = find_media_files(tmp_dir)
+    if not media_files:
+        raise RuntimeError(
+            "下载未完成：临时目录中未找到媒体文件。"
+            "若为 Bilibili 分P 视频，请在 URL 中添加 ?p=N 或使用 --part 指定分P。"
+        )
+    if len(media_files) > 1:
+        names = ", ".join(f.name for f in media_files)
+        raise RuntimeError(
+            f"找到多个下载文件（{names}），无法确定使用哪一个。"
+            "请使用 --part 指定分P，或在 URL 中添加 ?p=N。"
+        )
+    return str(media_files[0])
+
+
+def format_ytdlp_error(error: Exception) -> str:
+    """将 yt-dlp 异常转换为更易读的错误信息。"""
+    message = str(error).strip()
+    if "HTTP Error 412" in message:
+        return (
+            "Bilibili 拒绝了下载请求（HTTP 412）。"
+            "请确保已在浏览器中登录 Bilibili，并使用 --cookies-from-browser 指定对应浏览器。"
+        )
+    if "Sign in to confirm" in message:
+        return (
+            "YouTube 要求身份验证。"
+            "请使用 --cookies-from-browser 指定已登录的浏览器（如 chrome、firefox）。"
+        )
+    return f"yt-dlp 下载失败: {message}"
+
+
 def derive_output_path(output: str, video_title: str, ext: str) -> Path:
     """根据视频标题生成输出文件路径"""
     output_path = Path(output).expanduser().resolve()
@@ -76,28 +186,23 @@ def derive_output_path(output: str, video_title: str, ext: str) -> Path:
     return output_path
 
 
-def download_video(url: str, tmp_dir: Path, fmt: str = "mp3") -> Tuple[str, str, str]:
+def download_video(
+    url: str,
+    tmp_dir: Path,
+    fmt: str = "mp3",
+    cookies_from_browser: str = "chrome",
+) -> Tuple[str, str, str]:
     """Download the best audio/video stream using yt_dlp and return (file_path, video_id, video_title)."""
-    # 如果是MP4格式，下载最佳视频流；否则下载最佳音频流
-    if fmt == "mp4":
-        format_spec = "best[height<=1080]/best"
-    else:
-        format_spec = "bestaudio/best"
-    
-    ydl_opts = {
-        "format": format_spec,
-        "outtmpl": str(tmp_dir / "%(_id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
+    ydl_opts = build_ydl_opts(tmp_dir, fmt, cookies_from_browser)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        video_id = info.get("id") or "video"
-        video_title = info.get("title") or "Unknown Title"
-        downloaded_file = ydl.prepare_filename(info)
-    if not os.path.exists(downloaded_file):
-        raise RuntimeError("yt-dlp failed to download the requested video.")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            video_id = info.get("id") or "video"
+            video_title = info.get("title") or "Unknown Title"
+            downloaded_file = locate_downloaded_file(tmp_dir, ydl, info)
+    except DownloadError as e:
+        raise RuntimeError(format_ytdlp_error(e)) from e
     return downloaded_file, video_id, video_title
 
 
@@ -172,41 +277,47 @@ def get_video_title_with_ytdlp(url: str) -> str:
         return None
 
 
-def get_video_info(url: str, cookies_from_browser: str) -> dict:
+def get_video_info(url: str, cookies_from_browser: str, format_ext: str = "mp3") -> dict:
     """获取视频信息而不下载"""
-    # 首先尝试使用yt-dlp命令行获取标题
     title_from_cmd = get_video_title_with_ytdlp(url)
-    
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "cookiesfrombrowser": (cookies_from_browser,),
-        "extractor_retries": 3,
-        "fragment_retries": 3,
-        "retries": 3,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        
-        # 如果命令行获取到了更好的标题，使用它
-        if title_from_cmd:
-            info['title'] = title_from_cmd
-        
-        return info
+
+    ydl_opts = build_ydl_opts(None, format_ext, cookies_from_browser, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except DownloadError as e:
+        raise RuntimeError(format_ytdlp_error(e)) from e
+
+    if title_from_cmd:
+        info["title"] = title_from_cmd
+
+    return info
 
 
-def process_single_video(url: str, start: float, end: float, format_ext: str, output_dir: str, cookies_from_browser: str) -> Path:
+def process_single_video(
+    url: str,
+    start: float,
+    end: float,
+    format_ext: str,
+    output_dir: str,
+    cookies_from_browser: str,
+    part: Optional[int] = None,
+) -> Path:
     """处理单个视频的下载和转换"""
     with tempfile.TemporaryDirectory() as tmp_dir_name:
         tmp_dir = Path(tmp_dir_name)
 
+        url = apply_part_to_url(url, part)
+
         # Step 1: 先获取视频信息
         print(f"正在获取视频信息: {url}", file=sys.stderr)
-        info = get_video_info(url, cookies_from_browser)
+        info = get_video_info(url, cookies_from_browser, format_ext)
         video_title = info.get("title") or "Unknown Title"
-        duration_total = info.get("duration")
-        
+        duration_total = resolve_video_duration(info)
+
         print(f"视频标题: {video_title}", file=sys.stderr)
+        if part is not None:
+            print(f"分P: 第 {part} P", file=sys.stderr)
 
         # Step 2: 处理 start/end 默认值
         try:
@@ -215,8 +326,10 @@ def process_single_video(url: str, start: float, end: float, format_ext: str, ou
                 end_sec = end
             else:
                 if duration_total is None:
-                    sys.stderr.write("Error: Could not determine video duration. Please specify end time.\n")
-                    sys.exit(1)
+                    raise RuntimeError(
+                        "无法自动获取视频时长，请使用 --end 指定结束时间。"
+                        "若为 Bilibili 分P 视频，可使用 --part 指定分P编号。"
+                    )
                 end_sec = float(duration_total)
         except ValueError as e:
             sys.stderr.write(str(e) + "\n")
@@ -231,33 +344,15 @@ def process_single_video(url: str, start: float, end: float, format_ext: str, ou
         # Step 3: 根据视频标题生成输出路径
         output_path = derive_output_path(output_dir, video_title, format_ext)
 
-        # Step 4: 下载视频/音频
+        # Step 4: 下载视频/音频（默认仅下载当前分P，不下载整个合集）
         print(f"正在下载视频: {url}", file=sys.stderr)
-        # 如果是MP4格式，下载最佳视频流；否则下载最佳音频流
-        if format_ext == "mp4":
-            format_spec = "best[height<=1080]/best"
-        else:
-            format_spec = "bestaudio/best"
-        
-        ydl_opts = {
-            "format": format_spec,
-            "outtmpl": str(tmp_dir / "%(id)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "cookiesfrombrowser": (cookies_from_browser,),
-            "extractor_retries": 3,
-            "fragment_retries": 3,
-            "retries": 3,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            # 获取下载后的文件路径
-            video_id = info.get("id") or "video"
-            # 查找下载的文件
-            downloaded_files = list(tmp_dir.glob(f"{video_id}.*"))
-            if not downloaded_files:
-                raise RuntimeError("yt-dlp failed to download the requested video.")
-            downloaded_file = str(downloaded_files[0])
+        ydl_opts = build_ydl_opts(tmp_dir, format_ext, cookies_from_browser)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                downloaded_info = ydl.extract_info(url, download=True)
+                downloaded_file = locate_downloaded_file(tmp_dir, ydl, downloaded_info)
+        except DownloadError as e:
+            raise RuntimeError(format_ytdlp_error(e)) from e
 
         # Step 5: Cut and convert using ffmpeg
         print(f"正在处理: {video_title}", file=sys.stderr)
@@ -314,6 +409,12 @@ def main():
         default="chrome", 
         help="Browser to extract cookies from (chrome, firefox, safari, edge, etc.). Default: chrome"
     )
+    parser.add_argument(
+        "--part",
+        type=int,
+        default=None,
+        help="Bilibili 分P 编号（如 1、2）。未指定时默认下载第 1 P。",
+    )
 
     args = parser.parse_args()
 
@@ -360,7 +461,15 @@ def main():
     for i, url in enumerate(urls_to_process, 1):
         try:
             print(f"\n处理第 {i}/{len(urls_to_process)} 个视频...", file=sys.stderr)
-            output_path = process_single_video(url, start_sec, end_sec, args.format, output_path_arg, args.cookies_from_browser)
+            output_path = process_single_video(
+                url,
+                start_sec,
+                end_sec,
+                args.format,
+                output_path_arg,
+                args.cookies_from_browser,
+                part=args.part,
+            )
             successful_downloads.append(output_path)
             print(f"✓ 成功: {output_path}")
         except Exception as e:
