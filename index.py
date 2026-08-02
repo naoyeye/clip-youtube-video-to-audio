@@ -84,30 +84,52 @@ def resolve_video_duration(info: dict) -> Optional[float]:
     return None
 
 
+def site_origin(url: str) -> Optional[str]:
+    """从 URL 解析站点 origin，例如 https://www.example.com。"""
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def build_ydl_opts(
     tmp_dir: Optional[Path],
     format_ext: str,
-    cookies_from_browser: str,
+    cookies_from_browser: Optional[str],
     *,
     download: bool = True,
     noplaylist: bool = True,
+    referer_url: Optional[str] = None,
 ) -> dict:
     """构建 yt-dlp 通用选项。"""
     if format_ext == "mp4":
-        format_spec = "best[height<=1080]/best"
+        # 优先 HLS，部分站点（如 Pornhub）progressive 直链常 404/空文件
+        format_spec = "best[height<=1080][protocol^=m3u8]/best[height<=1080]/best"
     else:
-        format_spec = "bestaudio/best"
+        format_spec = "bestaudio[protocol^=m3u8]/best[protocol^=m3u8]/bestaudio/best"
 
     opts = {
         "format": format_spec,
         "quiet": True,
         "no_warnings": True,
-        "cookiesfrombrowser": (cookies_from_browser,),
         "extractor_retries": 3,
         "fragment_retries": 3,
         "retries": 3,
         "noplaylist": noplaylist,
     }
+
+    # 部分 CDN 要求 Referer，否则 m3u8 返回 412、progressive 返回空文件/404
+    if referer_url:
+        origin = site_origin(referer_url)
+        if origin:
+            opts["http_headers"] = {
+                "Referer": f"{origin}/",
+                "Origin": origin,
+            }
+
+    if cookies_from_browser and cookies_from_browser.lower() not in {"", "none", "off", "false"}:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+
     if download and tmp_dir is not None:
         opts["outtmpl"] = str(tmp_dir / "%(id)s.%(ext)s")
     return opts
@@ -152,8 +174,15 @@ def format_ytdlp_error(error: Exception) -> str:
     message = str(error).strip()
     if "HTTP Error 412" in message:
         return (
-            "Bilibili 拒绝了下载请求（HTTP 412）。"
-            "请确保已在浏览器中登录 Bilibili，并使用 --cookies-from-browser 指定对应浏览器。"
+            "站点拒绝了下载请求（HTTP 412）。"
+            "可尝试：更新 yt-dlp；或使用 --cookies-from-browser 指定已打开该站点的浏览器；"
+            "若已开启 cookies，可试 --cookies-from-browser none。"
+        )
+    if "downloaded file is empty" in message.lower() or "HTTP Error 404" in message:
+        return (
+            "下载文件为空或直链失效（常见于成人站点 progressive 地址）。"
+            "请更新 yt-dlp 后重试；仍失败时可加 --cookies-from-browser chrome|safari，"
+            "或 --cookies-from-browser none 关闭 cookies 再试。"
         )
     if "Sign in to confirm" in message:
         return (
@@ -186,6 +215,50 @@ def derive_output_path(output: str, video_title: str, ext: str) -> Path:
     return output_path
 
 
+def is_retryable_download_error(error: Exception) -> bool:
+    """判断是否值得去掉 cookies 后重试。"""
+    message = str(error).lower()
+    return any(
+        token in message
+        for token in (
+            "downloaded file is empty",
+            "http error 404",
+            "http error 412",
+            "unable to download video data",
+        )
+    )
+
+
+def download_with_ydl(url: str, ydl_opts: dict, tmp_dir: Path) -> Tuple[dict, str]:
+    """执行一次 yt-dlp 下载并定位文件。"""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return info, locate_downloaded_file(tmp_dir, ydl, info)
+
+
+def download_media(
+    url: str,
+    tmp_dir: Path,
+    format_ext: str,
+    cookies_from_browser: Optional[str],
+) -> Tuple[dict, str]:
+    """下载媒体；cookies 场景下若直链失败，自动无 cookies 重试一次。"""
+    ydl_opts = build_ydl_opts(tmp_dir, format_ext, cookies_from_browser, referer_url=url)
+    try:
+        return download_with_ydl(url, ydl_opts, tmp_dir)
+    except DownloadError as first_error:
+        cookies_enabled = bool(ydl_opts.get("cookiesfrombrowser"))
+        if not cookies_enabled or not is_retryable_download_error(first_error):
+            raise RuntimeError(format_ytdlp_error(first_error)) from first_error
+
+        print("cookies 下载失败，尝试不使用 cookies 重试...", file=sys.stderr)
+        retry_opts = build_ydl_opts(tmp_dir, format_ext, None, referer_url=url)
+        try:
+            return download_with_ydl(url, retry_opts, tmp_dir)
+        except DownloadError as retry_error:
+            raise RuntimeError(format_ytdlp_error(retry_error)) from retry_error
+
+
 def download_video(
     url: str,
     tmp_dir: Path,
@@ -193,16 +266,9 @@ def download_video(
     cookies_from_browser: str = "chrome",
 ) -> Tuple[str, str, str]:
     """Download the best audio/video stream using yt_dlp and return (file_path, video_id, video_title)."""
-    ydl_opts = build_ydl_opts(tmp_dir, fmt, cookies_from_browser)
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_id = info.get("id") or "video"
-            video_title = info.get("title") or "Unknown Title"
-            downloaded_file = locate_downloaded_file(tmp_dir, ydl, info)
-    except DownloadError as e:
-        raise RuntimeError(format_ytdlp_error(e)) from e
+    info, downloaded_file = download_media(url, tmp_dir, fmt, cookies_from_browser)
+    video_id = info.get("id") or "video"
+    video_title = info.get("title") or "Unknown Title"
     return downloaded_file, video_id, video_title
 
 
@@ -281,7 +347,9 @@ def get_video_info(url: str, cookies_from_browser: str, format_ext: str = "mp3")
     """获取视频信息而不下载"""
     title_from_cmd = get_video_title_with_ytdlp(url)
 
-    ydl_opts = build_ydl_opts(None, format_ext, cookies_from_browser, download=False)
+    ydl_opts = build_ydl_opts(
+        None, format_ext, cookies_from_browser, download=False, referer_url=url
+    )
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -346,13 +414,9 @@ def process_single_video(
 
         # Step 4: 下载视频/音频（默认仅下载当前分P，不下载整个合集）
         print(f"正在下载视频: {url}", file=sys.stderr)
-        ydl_opts = build_ydl_opts(tmp_dir, format_ext, cookies_from_browser)
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                downloaded_info = ydl.extract_info(url, download=True)
-                downloaded_file = locate_downloaded_file(tmp_dir, ydl, downloaded_info)
-        except DownloadError as e:
-            raise RuntimeError(format_ytdlp_error(e)) from e
+        _, downloaded_file = download_media(
+            url, tmp_dir, format_ext, cookies_from_browser
+        )
 
         # Step 5: Cut and convert using ffmpeg
         print(f"正在处理: {video_title}", file=sys.stderr)
@@ -405,9 +469,12 @@ def main():
         help="Path to the output directory or full file path where the file will be stored. Default: system Downloads directory.",
     )
     parser.add_argument(
-        "--cookies-from-browser", 
-        default="chrome", 
-        help="Browser to extract cookies from (chrome, firefox, safari, edge, etc.). Default: chrome"
+        "--cookies-from-browser",
+        default="chrome",
+        help=(
+            "从指定浏览器读取 cookies（chrome、firefox、safari、edge 等）。"
+            "传 none 可关闭。默认: chrome"
+        ),
     )
     parser.add_argument(
         "--part",
